@@ -1,10 +1,51 @@
 # per-file extraction cache - skip unchanged files on re-run
 from __future__ import annotations
 
+import functools
 import hashlib
 import json
 import os
 from pathlib import Path
+
+
+@functools.lru_cache(maxsize=None)
+def _git_root(directory: Path) -> Path | None:
+    """Return the git repository root for *directory*, or None if not in a repo."""
+    current = directory.resolve()
+    while True:
+        if (current / ".git").exists():
+            return current
+        parent = current.parent
+        if parent == current:
+            return None
+        current = parent
+
+
+@functools.lru_cache(maxsize=None)
+def _git_common_dir(directory: Path) -> Path | None:
+    """Return the shared .git directory — identical across all worktrees of a repo.
+
+    Regular clone  → <repo>/.git/
+    git worktree   → reads <worktree>/.git file, returns <repo>/.git/
+    Not a git repo → None
+    """
+    root = _git_root(directory)
+    if root is None:
+        return None
+    git_path = root / ".git"
+    if git_path.is_dir():
+        return git_path
+    if git_path.is_file():
+        content = git_path.read_text(encoding="utf-8").strip()
+        if content.startswith("gitdir:"):
+            worktree_git = Path(content[len("gitdir:"):].strip())
+            if not worktree_git.is_absolute():
+                worktree_git = (root / worktree_git).resolve()
+            # .git/worktrees/<branch>/ → .git/
+            common = worktree_git.parent.parent
+            if (common / "HEAD").exists():
+                return common
+    return None
 
 
 def _body_content(content: bytes) -> bytes:
@@ -42,8 +83,18 @@ def file_hash(path: Path, root: Path = Path(".")) -> str:
 
 
 def cache_dir(root: Path = Path(".")) -> Path:
-    """Returns graphify-out/cache/ - creates it if needed."""
-    d = Path(root) / "graphify-out" / "cache"
+    """Return the cache directory, creating it if needed.
+
+    When inside a git repository, the cache lives in <git-common-dir>/graphify-cache/
+    so all worktrees of the same repo share one cache — a worktree for a feature
+    branch that touches 3 of 500 files gets 497 cache hits instead of a cold start.
+    Outside a git repo, falls back to <root>/graphify-out/cache/.
+    """
+    common = _git_common_dir(Path(root).resolve())
+    if common is not None:
+        d = common / "graphify-cache"
+    else:
+        d = Path(root) / "graphify-out" / "cache"
     d.mkdir(parents=True, exist_ok=True)
     return d
 

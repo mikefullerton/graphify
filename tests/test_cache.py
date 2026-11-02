@@ -1,7 +1,20 @@
 """Tests for graphify/cache.py."""
 import pytest
 from pathlib import Path
-from graphify.cache import file_hash, cache_dir, load_cached, save_cached, cached_files, clear_cache, _body_content
+from graphify.cache import (
+    file_hash, cache_dir, load_cached, save_cached, cached_files, clear_cache,
+    _body_content, _git_root, _git_common_dir,
+)
+
+
+@pytest.fixture(autouse=True)
+def _clear_git_lookup_caches():
+    """lru_cache on _git_root/_git_common_dir persists between tests; clear it."""
+    _git_root.cache_clear()
+    _git_common_dir.cache_clear()
+    yield
+    _git_root.cache_clear()
+    _git_common_dir.cache_clear()
 
 
 @pytest.fixture
@@ -67,11 +80,99 @@ def test_cached_files(tmp_path, cache_root):
 
 
 def test_clear_cache(tmp_file, cache_root):
-    """clear_cache removes all .json files from graphify-out/cache/."""
+    """clear_cache removes all .json files from the cache directory."""
     save_cached(tmp_file, {"nodes": [], "edges": []}, root=cache_root)
-    assert len(list((cache_root / "graphify-out" / "cache").glob("*.json"))) > 0
+    cdir = cache_dir(cache_root)
+    assert len(list(cdir.glob("*.json"))) > 0
     clear_cache(cache_root)
-    assert len(list((cache_root / "graphify-out" / "cache").glob("*.json"))) == 0
+    assert len(list(cdir.glob("*.json"))) == 0
+
+
+def test_cache_dir_falls_back_when_not_in_git_repo(tmp_path):
+    """Outside a git repo, cache_dir returns <root>/graphify-out/cache/ (legacy)."""
+    d = cache_dir(tmp_path)
+    assert d == tmp_path / "graphify-out" / "cache"
+    assert d.exists()
+
+
+def test_cache_dir_uses_git_common_dir(tmp_path):
+    """Inside a git repo (regular clone), cache_dir returns <.git>/graphify-cache/."""
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    (repo / ".git").mkdir()  # simulate a regular clone
+    (repo / ".git" / "HEAD").write_text("ref: refs/heads/main\n")
+
+    d = cache_dir(repo)
+    assert d == repo / ".git" / "graphify-cache"
+    assert d.exists()
+
+
+def test_cache_dir_shared_between_main_and_worktree(tmp_path):
+    """Main tree and worktree resolve to the SAME cache directory."""
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    git_dir = repo / ".git"
+    git_dir.mkdir()
+    (git_dir / "HEAD").write_text("ref: refs/heads/main\n")
+    # Create the per-worktree git dir that a `git worktree add` would create
+    wt_git = git_dir / "worktrees" / "feature"
+    wt_git.mkdir(parents=True)
+    (wt_git / "HEAD").write_text("ref: refs/heads/feature\n")
+    # The worktree itself (separate directory, .git is a *file*)
+    worktree = tmp_path / "worktrees" / "feature"
+    worktree.mkdir(parents=True)
+    (worktree / ".git").write_text(f"gitdir: {wt_git}\n")
+
+    main_cache = cache_dir(repo)
+    wt_cache = cache_dir(worktree)
+
+    assert main_cache == wt_cache == git_dir / "graphify-cache"
+
+
+def test_cache_hit_across_worktrees(tmp_path):
+    """A file cached from the main tree is reused when that file appears in a worktree."""
+    repo = tmp_path / "repo"
+    (repo / "src").mkdir(parents=True)
+    git_dir = repo / ".git"
+    git_dir.mkdir()
+    (git_dir / "HEAD").write_text("ref: refs/heads/main\n")
+
+    # Same relative path + same content, different absolute paths.
+    main_file = repo / "src" / "foo.py"
+    main_file.write_text("def greet(): return 'hello'\n")
+
+    # Save cache from the main tree
+    result = {"nodes": [{"id": "greet"}], "edges": []}
+    save_cached(main_file, result, root=repo)
+
+    # Now set up the worktree with the SAME file content at the SAME relative path
+    wt_git = git_dir / "worktrees" / "feature"
+    wt_git.mkdir(parents=True)
+    (wt_git / "HEAD").write_text("ref: refs/heads/feature\n")
+    worktree = tmp_path / "worktrees" / "feature"
+    (worktree / "src").mkdir(parents=True)
+    (worktree / ".git").write_text(f"gitdir: {wt_git}\n")
+    wt_file = worktree / "src" / "foo.py"
+    wt_file.write_text("def greet(): return 'hello'\n")
+
+    # Loading from the worktree should hit the cache the main tree wrote.
+    loaded = load_cached(wt_file, root=worktree)
+    assert loaded == result
+
+
+def test_file_hash_portable_across_worktrees(tmp_path):
+    """Same content + same relative path → same hash, even at different absolute paths."""
+    repo_main = tmp_path / "main"
+    repo_wt = tmp_path / "worktree"
+    (repo_main / "src").mkdir(parents=True)
+    (repo_wt / "src").mkdir(parents=True)
+
+    f_main = repo_main / "src" / "foo.py"
+    f_wt = repo_wt / "src" / "foo.py"
+    f_main.write_text("x = 1\n")
+    f_wt.write_text("x = 1\n")
+
+    assert file_hash(f_main, root=repo_main) == file_hash(f_wt, root=repo_wt)
 
 
 def test_md_frontmatter_only_change_same_hash(tmp_path):
